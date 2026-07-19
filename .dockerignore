@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+models/
+*.mp4
+README.md

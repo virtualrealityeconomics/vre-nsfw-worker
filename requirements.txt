@@ -1,0 +1,8 @@
+# Runtime deps only. The ONNX model is exported + baked in the Dockerfile build stage
+# (transformers/torch/optimum are NOT needed at runtime).
+onnxruntime>=1.17
+pillow>=10
+numpy>=1.24,<2
+psycopg2-binary>=2.9
+boto3>=1.34
+requests>=2.31

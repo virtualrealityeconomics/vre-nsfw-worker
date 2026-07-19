@@ -1,0 +1,10 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.onnx
+/models/
+.venv/
+venv/
+*.mp4
+*.jpg
