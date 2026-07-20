@@ -1,6 +1,7 @@
-# Runtime deps only. The ONNX model is exported + baked in the Dockerfile build stage
-# (transformers/torch/optimum are NOT needed at runtime).
-onnxruntime>=1.17
+# Model = NudeNet v3 via the MIT-licensed `nudenet` package (per-body-part detector). The 320n.onnx
+# weights ship INSIDE the wheel — no runtime/build download needed. nudenet pulls onnxruntime +
+# opencv-python-headless (no ultralytics, no torch → zero Ultralytics code runs here).
+nudenet>=3.4.2
 pillow>=10
 numpy>=1.24,<2
 psycopg2-binary>=2.9

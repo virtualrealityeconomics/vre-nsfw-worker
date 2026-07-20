@@ -1,18 +1,13 @@
-# ── Stage 1: export Falconsai/nsfw_image_detection → ONNX (heavy build-only deps live here) ──────
-FROM python:3.11-slim AS builder
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install --no-cache-dir "optimum[exporters]" transformers onnx
-# Downloads the model from HuggingFace and writes /export/model.onnx (input: pixel_values 1x3x224x224).
-RUN optimum-cli export onnx --model Falconsai/nsfw_image_detection --task image-classification /export
-
-# ── Stage 2: lean runtime (onnxruntime + ffmpeg + the baked model only — no torch) ───────────────
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# ffmpeg = video frame sampling. opencv-python-headless (pulled by nudenet) needs no GUI libs, but
+# libgl1/libglib2 are kept as a cheap safety net for onnxruntime/opencv on slim.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --from=builder /export/model.onnx /models/nsfw.onnx
+# The NudeNet v3 model (320n.onnx) ships inside the nudenet wheel — nothing to download. Warm the
+# ONNX session once at build so first-request latency is low and the import is proven at build time.
+RUN python -c "from nudenet import NudeDetector; NudeDetector(); print('nudenet v3 ready')"
 COPY . .
-# Headless poller; the only listener is the secret-gated /metrics on $PORT.
 CMD ["python", "main.py"]

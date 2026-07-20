@@ -18,35 +18,24 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import numpy as np
 from PIL import Image
 
 import config
 import db
 import frames
+import gate
 import nsfw
 import r2
 
 _stop = threading.Event()
 
 
-def _verdict(p_nsfw):
-    """3-band gate on the aggregated P(nsfw)."""
-    if p_nsfw >= config.T_BLOCK:
-        return "rejected"      # hide + quarantine
-    if p_nsfw >= config.T_PASS:
-        return "flagged"       # hide; admin reviews
-    return "approved"
-
-
-def _aggregate(scores):
-    """MAX (or a high percentile) — one explicit frame/image fails the whole item."""
-    if scores is None or len(scores) == 0:
-        return None
-    a = np.asarray(scores, dtype=np.float32)
-    if config.VIDEO_AGG_PCT >= 1.0:
-        return float(a.max())
-    return float(np.percentile(a, config.VIDEO_AGG_PCT * 100))
+def _top(scores):
+    """Compact 'label=score' of the strongest detection, for logs."""
+    if not scores:
+        return "clean"
+    lbl = max(scores, key=scores.get)
+    return f"{lbl}={round(scores[lbl], 3)}"
 
 
 # ── Image (optimistic: already public, so we only ACT on flagged/rejected) ───────────────────────
@@ -61,28 +50,31 @@ def process_image_post(row):
             print(f"[image] fetch failed post={row['id']}: {type(e).__name__}: {e}", flush=True)
             db.fail("Post", row["id"], row["moderationAttempts"])
             return
-    p = _aggregate(nsfw.score_images(imgs))
-    if p is None:
+    if not imgs:
         db.fail("Post", row["id"], row["moderationAttempts"])
         return
-    status = _verdict(p)
-    db.resolve_post(row["id"], status, round(p, 4), {"pnsfw": round(p, 4), "count": len(urls)})
+    d = gate.decide_images(imgs)                       # NudeNet free pre-block → Claude vision
+    status = d["status"]
+    labels = dict(d.get("scores") or {})               # persist the reason + which layer decided
+    labels["_reason"] = d.get("reason", "")
+    labels["_layer"] = d.get("layer", "")
+    db.resolve_post(row["id"], status, round(d.get("score", 0.0), 4), labels)
     if status == "rejected":
         keys = [r2.url_to_key(u) for u in (row.get("mediaUrls") or [])
                 + (row.get("mediaUrlsSmall") or []) + (row.get("mediaUrlsMedium") or [])]
         r2.quarantine_keys(keys)
-    print(f"[image] post={row['id']} p={round(p, 3)} -> {status}", flush=True)
+    print(f"[image] post={row['id']} {_top(d.get('scores') or {})} [{d.get('layer')}] -> {status} ({d.get('reason','')})", flush=True)
 
 
 # ── Video ─────────────────────────────────────────────────────────────────────────────────────────
 def _scan_video(url):
-    """Download → sample frames → aggregated P(nsfw). None = unscannable → retry (NEVER approve unseen)."""
+    """Download → sample frames → per-label MAX scores. None = unscannable → retry (NEVER approve unseen)."""
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tf:
         r2.download_to(url, tf.name)
         fr = frames.sample(tf.name)
     if not fr:
         return None
-    return _aggregate(nsfw.score_images(fr))
+    return nsfw.detect_max(fr)
 
 
 def _video_keys(row):
@@ -95,36 +87,36 @@ def _video_keys(row):
 
 def process_video(row):
     try:
-        p = _scan_video(row["videoUrl"])
+        scores = _scan_video(row["videoUrl"])
     except Exception as e:
         print(f"[video] scan failed id={row['id']}: {type(e).__name__}: {e}", flush=True)
         db.fail("Video", row["id"], row["moderationAttempts"])
         return
-    if p is None:
+    if scores is None:
         db.fail("Video", row["id"], row["moderationAttempts"])
         return
-    status = _verdict(p)
-    db.resolve_video(row["id"], row.get("postId"), status, round(p, 4), {"pnsfw": round(p, 4)})
+    status, _, sc = config.verdict(scores)
+    db.resolve_video(row["id"], row.get("postId"), status, round(sc, 4), scores)
     if status == "rejected":
         r2.quarantine_keys(_video_keys(row))
-    print(f"[video] id={row['id']} p={round(p, 3)} -> {status}", flush=True)
+    print(f"[video] id={row['id']} {_top(scores)} -> {status}", flush=True)
 
 
 def process_orphan_video_post(row):
     try:
-        p = _scan_video(row["videoUrl"])
+        scores = _scan_video(row["videoUrl"])
     except Exception as e:
         print(f"[orphan] scan failed post={row['id']}: {type(e).__name__}: {e}", flush=True)
         db.fail("Post", row["id"], row["moderationAttempts"])
         return
-    if p is None:
+    if scores is None:
         db.fail("Post", row["id"], row["moderationAttempts"])
         return
-    status = _verdict(p)  # SFW → 'approved' publishes it (plays raw MP4; there's no Video to transcode)
-    db.resolve_post(row["id"], status, round(p, 4), {"pnsfw": round(p, 4)})
+    status, _, sc = config.verdict(scores)  # SFW → 'approved' publishes it (raw MP4; no Video to transcode)
+    db.resolve_post(row["id"], status, round(sc, 4), scores)
     if status == "rejected":
         r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))])
-    print(f"[orphan] post={row['id']} p={round(p, 3)} -> {status}", flush=True)
+    print(f"[orphan] post={row['id']} {_top(scores)} -> {status}", flush=True)
 
 
 # ── Loops ─────────────────────────────────────────────────────────────────────────────────────────
@@ -187,7 +179,7 @@ def _serve_metrics():
 
 
 def main():
-    print(f"[boot] nsfw-worker starting (T_PASS={config.T_PASS} T_BLOCK={config.T_BLOCK})", flush=True)
+    print(f"[boot] nsfw-worker (NudeNet v3); block-thresholds={config.BLOCK_THRESHOLDS}", flush=True)
     if not config.DIRECT_URL:
         print("[boot] FATAL: DIRECT_URL unset", flush=True)
         sys.exit(1)
