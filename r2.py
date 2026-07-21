@@ -90,6 +90,29 @@ def quarantine_keys(keys):
     return moved
 
 
+def un_quarantine_keys(keys):
+    """Reverse of quarantine_keys (D7): copy each object back from the quarantine prefix to its public
+    key, then delete the quarantine copy — used by the admin-approve action to restore a previously
+    REJECTED item. Missing quarantine copies are skipped (idempotent)."""
+    c = _client()
+    restored = 0
+    for key in keys:
+        if not key:
+            continue
+        src = config.QUARANTINE_PREFIX + key
+        try:
+            c.copy_object(
+                Bucket=config.R2_BUCKET_NAME,
+                CopySource={"Bucket": config.R2_BUCKET_NAME, "Key": src},
+                Key=key,
+            )
+            c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=src)
+            restored += 1
+        except Exception as e:
+            print(f"[r2] un-quarantine {key} failed ({type(e).__name__}: {e})", flush=True)
+    return restored
+
+
 def list_prefix(prefix):
     """All keys under a prefix (paginated) — for sweeping the variable HLS `.ts` segment set."""
     if not prefix:

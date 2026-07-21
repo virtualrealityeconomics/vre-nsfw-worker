@@ -85,6 +85,31 @@ def _video_keys(row):
     return keys
 
 
+_RANK = {"approved": 0, "flagged": 1, "rejected": 2, "error": 3}
+
+
+def _worst(a, b):
+    return a if _RANK.get(a, 0) >= _RANK.get(b, 0) else b
+
+
+def _scan_thumbnail(post_id):
+    """CR2: a video post's client thumbnail (Post.mediaUrls) renders as the public poster but is
+    scanned by NO image loop (claim_image_post excludes posts with a videoUrl). Scan it here with the
+    full image gate so an SFW video with an NSFW thumbnail can't slip through. → (status, scores)."""
+    urls = [u for u in (db.post_media_urls(post_id) or []) if u]
+    imgs = []
+    for u in urls:
+        try:
+            data = r2.fetch_public(u, max_bytes=config.MAX_IMAGE_BYTES)
+            imgs.append(Image.open(io.BytesIO(data)).convert("RGB"))
+        except Exception as e:
+            print(f"[thumb] fetch failed post={post_id}: {type(e).__name__}: {e}", flush=True)
+    if not imgs:
+        return "approved", {}, urls
+    d = gate.decide_images(imgs)
+    return d["status"], d.get("scores") or {}, urls
+
+
 def process_video(row):
     try:
         scores = _scan_video(row["videoUrl"])
@@ -96,10 +121,16 @@ def process_video(row):
         db.fail("Video", row["id"], row["moderationAttempts"])
         return
     status, _, sc = config.verdict(scores)
-    db.resolve_video(row["id"], row.get("postId"), status, round(sc, 4), scores)
+    t_status, t_scores, _media = _scan_thumbnail(row.get("postId"))  # CR2 (quarantine set re-derived below)
+    status = _worst(status, t_status)
+    labels = dict(scores)
+    labels.update({"thumb_" + k: v for k, v in t_scores.items()})
+    db.resolve_video(row["id"], row.get("postId"), status, round(sc, 4), labels)
     if status == "rejected":
-        r2.quarantine_keys(_video_keys(row))
-    print(f"[video] id={row['id']} {_top(scores)} -> {status}", flush=True)
+        # R2: quarantine the FULL thumbnail derivative set (Small/Medium too), not just what we scanned.
+        thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row.get("postId")) or [])]
+        r2.quarantine_keys(_video_keys(row) + thumb_keys)
+    print(f"[video] id={row['id']} v={_top(scores)} thumb={t_status} -> {status}", flush=True)
 
 
 def process_orphan_video_post(row):
@@ -113,10 +144,16 @@ def process_orphan_video_post(row):
         db.fail("Post", row["id"], row["moderationAttempts"])
         return
     status, _, sc = config.verdict(scores)  # SFW → 'approved' publishes it (raw MP4; no Video to transcode)
-    db.resolve_post(row["id"], status, round(sc, 4), scores)
+    t_status, t_scores, _media = _scan_thumbnail(row["id"])  # CR2 (quarantine set re-derived below)
+    status = _worst(status, t_status)
+    labels = dict(scores)
+    labels.update({"thumb_" + k: v for k, v in t_scores.items()})
+    db.resolve_post(row["id"], status, round(sc, 4), labels)
     if status == "rejected":
-        r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))])
-    print(f"[orphan] post={row['id']} {_top(scores)} -> {status}", flush=True)
+        # R2: quarantine the FULL thumbnail derivative set (Small/Medium too), not just what we scanned.
+        thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row["id"]) or [])]
+        r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))] + thumb_keys)
+    print(f"[orphan] post={row['id']} v={_top(scores)} thumb={t_status} -> {status}", flush=True)
 
 
 # ── Loops ─────────────────────────────────────────────────────────────────────────────────────────

@@ -108,13 +108,61 @@ def claim_orphan_video_post():
     return _exec(sql, (config.MAX_ATTEMPTS, config.LEASE_MINUTES), fetch="one")
 
 
+def post_media_urls(post_id):
+    """A post's client-supplied images (CR2: a video post's thumbnail publishes as the poster but no
+    image loop scans it — the video loop scans it separately). Full-size only → what we SCAN."""
+    if not post_id:
+        return []
+    r = _exec('SELECT "mediaUrls" FROM "Post" WHERE id=%s', (post_id,), fetch="one")
+    return (r or {}).get("mediaUrls") or []
+
+
+def post_media_all_urls(post_id):
+    """R2: the FULL derivative set (mediaUrls + Small + Medium) for a video post's thumbnail — what we
+    QUARANTINE on reject, so the 320/800px NSFW thumbnails don't stay public while the full-size is
+    pulled. Scanning still uses only full-size (post_media_urls)."""
+    if not post_id:
+        return []
+    r = _exec(
+        'SELECT "mediaUrls", "mediaUrlsSmall", "mediaUrlsMedium" FROM "Post" WHERE id=%s',
+        (post_id,), fetch="one",
+    ) or {}
+    seen, out = set(), []
+    for col in ("mediaUrls", "mediaUrlsSmall", "mediaUrlsMedium"):
+        for u in (r.get(col) or []):
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+    return out
+
+
 # ── Verdicts ────────────────────────────────────────────────────────────────────────────────────
+def _notify_hidden(post_id):
+    """Tell the owner (once) their post is under review — fires on flag/reject. Best-effort; the
+    backoffice badge is the primary signal, so a failed insert never blocks the verdict."""
+    if not post_id:
+        return
+    try:
+        _exec(
+            'INSERT INTO "Notification" (id,"userId",type,title,"entityType","entityId","linkPath","actorType","createdAt") '
+            "SELECT gen_random_uuid(), p.\"userId\", 'content_flagged', 'Your content is under review', "
+            "'post', p.id, '/posts?backoffice=true&tab=my-posts&highlight='||p.id, 'system', NOW() "
+            'FROM "Post" p WHERE p.id=%s '
+            "AND NOT EXISTS (SELECT 1 FROM \"Notification\" n WHERE n.type='content_flagged' AND n.\"entityId\"=p.id)",
+            (post_id,),
+        )
+    except Exception as e:
+        print(f"[notify] content_flagged failed post={post_id}: {type(e).__name__}: {e}", flush=True)
+
+
 def resolve_post(post_id, status, score, labels):
     _exec(
         'UPDATE "Post" SET "moderationStatus"=%s, "moderatedAt"=NOW(), "moderationScore"=%s, '
         '"moderationLabels"=%s, "moderationLockedAt"=NULL WHERE id=%s',
         (status, score, psycopg2.extras.Json(labels) if labels is not None else None, post_id),
     )
+    if status in ("flagged", "rejected"):
+        _notify_hidden(post_id)
 
 
 def resolve_video(video_id, post_id, status, score, labels):
@@ -130,6 +178,8 @@ def resolve_video(video_id, post_id, status, score, labels):
         '"moderationLabels"=%s, "moderationLockedAt"=NULL WHERE id=%s',
         (status, score, psycopg2.extras.Json(labels) if labels is not None else None, video_id),
     )
+    if status in ("flagged", "rejected"):
+        _notify_hidden(post_id)
 
 
 def fail(table, row_id, current_attempts):
