@@ -81,7 +81,11 @@ def quarantine_keys(keys):
             c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
             moved += 1
         except Exception as e:
-            # Do NOT leave the public copy live — an NSFW object must 404 even if the appeal-copy failed.
+            # Benign + expected: the source is already quarantined (public copy gone) → NoSuchKey. The bytes
+            # are already non-public, nothing to do. Any OTHER error → force-delete so nothing stays public.
+            msg = str(e)
+            if "NoSuchKey" in msg or "does not exist" in msg:
+                continue
             print(f"[r2] quarantine {key} failed ({type(e).__name__}: {e}); force-deleting public copy", flush=True)
             try:
                 c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
