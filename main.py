@@ -148,6 +148,7 @@ def _scan_thumbnail(post_id):
 
 def process_video(row):
     t0 = time.time()
+    _log(f'[video] ▶ NEW {_fname(row["videoUrl"])} — downloading + analyzing… (id={row["id"]})')
     # Whole critical path (scan → decide → thumbnail → resolve) is wrapped: any error → db.fail (bounded
     # retries → terminal 'error'), never a silently-stuck row. Quarantine + log run AFTER, best-effort.
     try:
@@ -177,6 +178,7 @@ def process_video(row):
 
 def process_orphan_video_post(row):
     t0 = time.time()
+    _log(f'[orphan] ▶ NEW {_fname(row["videoUrl"])} — downloading + analyzing… (post={row["id"]})')
     try:
         res = _scan_video(row["videoUrl"])
         if res is None:
