@@ -80,11 +80,39 @@ def verdict(scores):
         l, s = max(hits, key=lambda x: x[1]);  return "flagged", l, s
     return "approved", None, (max(scores.values()) if scores else 0.0)
 
+
+# EXPLICIT-NUDITY classes: a NudeNet hit here is HIGH-PRECISION and NON-overridable — never handed to a
+# lenient 320px vision second-opinion (which could wrongly ALLOW it). Only the ambiguous "elegance" band
+# (BELLY / *_COVERED / shirtless) is vision-routable. See vre-nsfw-video-vision-plan.md (audit).
+HARD_NUDITY = {
+    "FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED", "ANUS_EXPOSED",
+    "FEMALE_BREAST_EXPOSED", "BUTTOCKS_EXPOSED",
+}
+
+
+def hard_hit(scores):
+    """Strongest EXPLICIT-NUDITY signal → (status, label, score), status ∈ 'rejected'|'flagged'|None.
+    'rejected' = a BLOCK-band hit (auto-block, never vision-overridable). 'flagged' = a low-confidence
+    FLAG-band hit (hold for human review — a 320px vision must NOT be allowed to approve it)."""
+    blk = [(l, scores.get(l, 0.0)) for l in HARD_NUDITY if scores.get(l, 0.0) >= BLOCK_THRESHOLDS.get(l, 99)]
+    if blk:
+        l, s = max(blk, key=lambda x: x[1]);  return "rejected", l, s
+    flg = [(l, scores.get(l, 0.0)) for l in HARD_NUDITY if scores.get(l, 0.0) >= FLAG_THRESHOLDS.get(l, 99)]
+    if flg:
+        l, s = max(flg, key=lambda x: x[1]);  return "flagged", l, s
+    return None, None, 0.0
+
 # ── Claude vision (hybrid layer 2 — IMAGES only; videos stay NudeNet-only to avoid per-frame cost) ─
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 VISION_ENABLED    = os.environ.get("NSFW_VISION_ENABLED", "1") not in ("0", "false", "no")
 # On a vision API error: default holds the image for review (safe); fail-open trusts the free gate.
 VISION_FAIL_OPEN  = os.environ.get("NSFW_VISION_FAIL_OPEN", "") in ("1", "true", "yes")
+
+# ── Video → vision (cost control): only the ELEGANCE band pays for vision, and only clearly-suspicious,
+# deduped, capped frames. Clean/hard-nudity frames never call vision. Tune to trade cost vs strictness.
+VIDEO_VISION_MIN    = _f("NSFW_VIDEO_VISION_MIN", "0.55")                          # soft frame must be ≥ this to be worth a vision call
+VIDEO_VISION_FRAMES = int(os.environ.get("NSFW_VIDEO_VISION_FRAMES", "2"))         # max vision calls per video (post-dedupe)
+VIDEO_DEDUPE_HAMMING = int(os.environ.get("NSFW_VIDEO_DEDUPE_HAMMING", "6"))       # ≤ this aHash distance = same shot, skip
 
 # ── Video frame sampling (ffmpeg) ──────────────────────────────────────────────────────────────
 SCENE_THRESHOLD = float(os.environ.get("NSFW_SCENE_THRESHOLD", "0.3"))  # select='gt(scene,X)'

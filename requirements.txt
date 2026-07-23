@@ -7,3 +7,4 @@ numpy>=1.24,<2
 psycopg2-binary>=2.9
 boto3>=1.34
 requests>=2.31
+tzdata

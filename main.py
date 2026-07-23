@@ -10,12 +10,14 @@ different rows and a crash self-heals (stale lease → re-claimable). No coordin
 """
 import io
 import json
+import os
 import socket
 import sys
 import tempfile
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image
@@ -29,6 +31,23 @@ import r2
 
 _stop = threading.Event()
 
+# ── Logging: human Israel-time stamp + "what am I testing" context. tzdata may be absent on a slim
+# image → fall back to UTC rather than crash the whole worker over a cosmetic timestamp.
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(os.environ.get("NSFW_LOG_TZ", "Asia/Jerusalem"))
+except Exception:
+    _TZ = timezone.utc
+
+
+def _log(msg):
+    print(f"[{datetime.now(_TZ).strftime('%Y-%m-%d %H:%M:%S')} IL] {msg}", flush=True)
+
+
+def _fname(url):
+    """Uploaded filename from an R2 url — so logs say WHAT is being scanned."""
+    return ((url or "").split("?")[0].rsplit("/", 1)[-1] or "?")[:60]
+
 
 def _top(scores):
     """Compact 'label=score' of the strongest detection, for logs."""
@@ -40,6 +59,7 @@ def _top(scores):
 
 # ── Image (optimistic: already public, so we only ACT on flagged/rejected) ───────────────────────
 def process_image_post(row):
+    t0 = time.time()
     urls = [u for u in (row.get("mediaUrls") or []) if u]
     imgs = []
     for u in urls:
@@ -47,7 +67,7 @@ def process_image_post(row):
             data = r2.fetch_public(u, max_bytes=config.MAX_IMAGE_BYTES)
             imgs.append(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception as e:
-            print(f"[image] fetch failed post={row['id']}: {type(e).__name__}: {e}", flush=True)
+            _log(f"[image] fetch failed post={row['id']}: {type(e).__name__}: {e}")
             db.fail("Post", row["id"], row["moderationAttempts"])
             return
     if not imgs:
@@ -63,18 +83,32 @@ def process_image_post(row):
         keys = [r2.url_to_key(u) for u in (row.get("mediaUrls") or [])
                 + (row.get("mediaUrlsSmall") or []) + (row.get("mediaUrlsMedium") or [])]
         r2.quarantine_keys(keys)
-    print(f"[image] post={row['id']} {_top(d.get('scores') or {})} [{d.get('layer')}] -> {status} ({d.get('reason','')})", flush=True)
+    ctx = db.describe(row["id"])
+    _log(f'[image] "{ctx["title"]}" by {ctx["author"]} · {_fname(urls[0] if urls else "")} · '
+         f'{_top(d.get("scores") or {})}[{d.get("layer")}:{d.get("reason","")}] '
+         f'-> {status.upper()} {"✅" if status == "approved" else "❌"} · {time.time()-t0:.1f}s')
 
 
 # ── Video ─────────────────────────────────────────────────────────────────────────────────────────
 def _scan_video(url):
-    """Download → sample frames → per-label MAX scores. None = unscannable → retry (NEVER approve unseen)."""
+    """Download → sample frames → per-frame NudeNet. Returns (agg, suspicious):
+        agg        = {label: max across all frames}   (for logs / persistence)
+        suspicious = [(frame_img, frame_scores)] for frames NudeNet didn't clear (kept for the vision pass).
+    None = unscannable → retry (NEVER approve unseen)."""
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tf:
         r2.download_to(url, tf.name)
         fr = frames.sample(tf.name)
     if not fr:
         return None
-    return nsfw.detect_max(fr)
+    agg, suspicious = {}, []
+    for im in fr:
+        sc = nsfw.detect_image(im)
+        for lbl, v in sc.items():
+            if v > agg.get(lbl, 0.0):
+                agg[lbl] = v
+        if config.verdict(sc)[0] != "approved":
+            suspicious.append((im, sc))
+    return agg, suspicious, len(fr)
 
 
 def _video_keys(row):
@@ -103,57 +137,69 @@ def _scan_thumbnail(post_id):
             data = r2.fetch_public(u, max_bytes=config.MAX_IMAGE_BYTES)
             imgs.append(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception as e:
-            print(f"[thumb] fetch failed post={post_id}: {type(e).__name__}: {e}", flush=True)
+            _log(f"[thumb] fetch failed post={post_id}: {type(e).__name__}: {e}")
     if not imgs:
         return "approved", {}, urls
-    d = gate.decide_images(imgs)
+    # free_block=False: the poster is a video frame too — let vision rescue a squirrel-belly poster,
+    # while explicit nudity still hard-blocks (decide_image step 1).
+    d = gate.decide_images(imgs, free_block=False)
     return d["status"], d.get("scores") or {}, urls
 
 
 def process_video(row):
+    t0 = time.time()
+    # Whole critical path (scan → decide → thumbnail → resolve) is wrapped: any error → db.fail (bounded
+    # retries → terminal 'error'), never a silently-stuck row. Quarantine + log run AFTER, best-effort.
     try:
-        scores = _scan_video(row["videoUrl"])
+        res = _scan_video(row["videoUrl"])
+        if res is None:
+            db.fail("Video", row["id"], row["moderationAttempts"])
+            return
+        agg, suspicious, n = res
+        d = gate.decide_video(agg, suspicious)                    # clean → free; elegance band → vision
+        t_status, t_scores, _media = _scan_thumbnail(row.get("postId"))   # CR2
+        status = _worst(d["status"], t_status)
+        labels = dict(agg); labels["_reason"] = d.get("reason", ""); labels["_layer"] = d.get("layer", "")
+        labels.update({"thumb_" + k: v for k, v in t_scores.items()})
+        db.resolve_video(row["id"], row.get("postId"), status, round(d.get("score", 0.0), 4), labels)
     except Exception as e:
-        print(f"[video] scan failed id={row['id']}: {type(e).__name__}: {e}", flush=True)
+        _log(f"[video] scan failed id={row['id']}: {type(e).__name__}: {e}")
         db.fail("Video", row["id"], row["moderationAttempts"])
         return
-    if scores is None:
-        db.fail("Video", row["id"], row["moderationAttempts"])
-        return
-    status, _, sc = config.verdict(scores)
-    t_status, t_scores, _media = _scan_thumbnail(row.get("postId"))  # CR2 (quarantine set re-derived below)
-    status = _worst(status, t_status)
-    labels = dict(scores)
-    labels.update({"thumb_" + k: v for k, v in t_scores.items()})
-    db.resolve_video(row["id"], row.get("postId"), status, round(sc, 4), labels)
     if status == "rejected":
-        # R2: quarantine the FULL thumbnail derivative set (Small/Medium too), not just what we scanned.
         thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row.get("postId")) or [])]
         r2.quarantine_keys(_video_keys(row) + thumb_keys)
-    print(f"[video] id={row['id']} v={_top(scores)} thumb={t_status} -> {status}", flush=True)
+    ctx = db.describe(row.get("postId"))
+    _log(f'[video] "{ctx["title"]}" by {ctx["author"]} · {_fname(row["videoUrl"])} · {n}f/{len(suspicious)}susp · '
+         f'v={_top(agg)}[{d.get("layer")}:{d.get("reason","")}] vision={d.get("vision_frames",0)} thumb={t_status} '
+         f'-> {status.upper()} {"✅" if status == "approved" else "❌"} · {time.time()-t0:.1f}s')
 
 
 def process_orphan_video_post(row):
+    t0 = time.time()
     try:
-        scores = _scan_video(row["videoUrl"])
+        res = _scan_video(row["videoUrl"])
+        if res is None:
+            db.fail("Post", row["id"], row["moderationAttempts"])
+            return
+        agg, suspicious, n = res
+        d = gate.decide_video(agg, suspicious)   # SFW → 'approved' publishes the raw MP4 (no transcode)
+        t_status, t_scores, _media = _scan_thumbnail(row["id"])   # CR2
+        status = _worst(d["status"], t_status)
+        labels = dict(agg); labels["_reason"] = d.get("reason", ""); labels["_layer"] = d.get("layer", "")
+        labels.update({"thumb_" + k: v for k, v in t_scores.items()})
+        db.resolve_post(row["id"], status, round(d.get("score", 0.0), 4), labels)
     except Exception as e:
-        print(f"[orphan] scan failed post={row['id']}: {type(e).__name__}: {e}", flush=True)
+        _log(f"[orphan] scan failed post={row['id']}: {type(e).__name__}: {e}")
         db.fail("Post", row["id"], row["moderationAttempts"])
         return
-    if scores is None:
-        db.fail("Post", row["id"], row["moderationAttempts"])
-        return
-    status, _, sc = config.verdict(scores)  # SFW → 'approved' publishes it (raw MP4; no Video to transcode)
-    t_status, t_scores, _media = _scan_thumbnail(row["id"])  # CR2 (quarantine set re-derived below)
-    status = _worst(status, t_status)
-    labels = dict(scores)
-    labels.update({"thumb_" + k: v for k, v in t_scores.items()})
-    db.resolve_post(row["id"], status, round(sc, 4), labels)
     if status == "rejected":
-        # R2: quarantine the FULL thumbnail derivative set (Small/Medium too), not just what we scanned.
         thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row["id"]) or [])]
         r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))] + thumb_keys)
-    print(f"[orphan] post={row['id']} v={_top(scores)} thumb={t_status} -> {status}", flush=True)
+    ctx = db.describe(row["id"])
+    _log(f'[orphan] "{ctx["title"]}" by {ctx["author"]} · {_fname(row["videoUrl"])} · {n}f/{len(suspicious)}susp · '
+         f'v={_top(agg)}[{d.get("layer")}:{d.get("reason","")}] vision={d.get("vision_frames",0)} thumb={t_status} '
+         f'-> {status.upper()} {"✅" if status == "approved" else "❌"} · {time.time()-t0:.1f}s')
 
 
 # ── Loops ─────────────────────────────────────────────────────────────────────────────────────────

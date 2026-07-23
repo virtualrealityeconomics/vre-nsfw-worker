@@ -136,6 +136,24 @@ def post_media_all_urls(post_id):
     return out
 
 
+def describe(post_id):
+    """Author + a short title for the scan log ("what am I testing"). ONE cheap SELECT, FULLY best-effort
+    — a cosmetic log helper must NEVER raise into the scan path. Columns match schema.prisma
+    (Post.content/userId, User.username/handle)."""
+    default = {"author": "?", "title": ""}
+    if not post_id:
+        return default
+    try:
+        r = _exec(
+            'SELECT COALESCE(u.username, u.handle, \'?\') AS author, LEFT(COALESCE(p.content, \'\'), 40) AS title '
+            'FROM "Post" p LEFT JOIN "User" u ON u.id = p."userId" WHERE p.id=%s',
+            (post_id,), fetch="one",
+        )
+        return r or default
+    except Exception:
+        return default
+
+
 # ── Verdicts ────────────────────────────────────────────────────────────────────────────────────
 def _notify_hidden(post_id):
     """Tell the owner (once) their post is under review — fires on flag/reject. Best-effort; the
