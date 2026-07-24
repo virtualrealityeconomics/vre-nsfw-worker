@@ -28,6 +28,7 @@ import frames
 import gate
 import nsfw
 import r2
+import sysmetrics
 
 _stop = threading.Event()
 
@@ -234,8 +235,10 @@ def video_loop():
 
 
 # ── Metrics (secret-gated; a backed-up/down worker = a growing backlog the dash can alert on) ─────
-class _V6Server(ThreadingHTTPServer):
-    address_family = socket.AF_INET6  # Railway internal networking is IPv6
+# Bind AF_INET / 0.0.0.0 so the admin dashboard (Railway) can poll this box on its public IPv4, exactly
+# like vre-video-worker. The old IPv6-only (`::`) bind was a Railway-internal assumption that never
+# applied here — this worker runs on Vultr — and it REFUSED the dashboard's IPv4 connection.
+class _MetricsServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
@@ -246,7 +249,21 @@ class _Metrics(BaseHTTPRequestHandler):
         if config.METRICS_SECRET and self.headers.get("x-metrics-secret") != config.METRICS_SECRET:
             self.send_response(401); self.end_headers(); return
         try:
-            body = json.dumps(db.metrics()).encode()
+            # System stats first (pure-local, always works) so the Servers card renders even if the DB
+            # is momentarily down; the DB-backed moderation queue degrades to {error} on its own.
+            payload = sysmetrics.collect()
+            try:
+                dbm = db.metrics()  # {post, video, backlog}
+                bk = dbm.get("backlog", {}) or {}
+                payload["queue"] = {
+                    "pending": (bk.get("images") or 0) + (bk.get("videos") or 0),  # the scale signal
+                    "processing": 0,  # NudeNet is per-row + fast; no distinct in-flight status to report
+                    "failed": (dbm.get("post", {}).get("error") or 0) + (dbm.get("video", {}).get("error") or 0),
+                }
+                payload["moderation"] = dbm  # full status breakdown for anyone who wants the detail
+            except Exception as e:
+                payload["queue"] = {"error": str(e)}
+            body = json.dumps(payload).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(body)
         except Exception as e:
@@ -258,7 +275,7 @@ class _Metrics(BaseHTTPRequestHandler):
 
 def _serve_metrics():
     try:
-        _V6Server(("::", config.METRICS_PORT), _Metrics).serve_forever()
+        _MetricsServer(("0.0.0.0", config.METRICS_PORT), _Metrics).serve_forever()
     except Exception as e:
         print(f"[metrics] server failed: {type(e).__name__}: {e}", flush=True)
 
