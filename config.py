@@ -124,6 +124,10 @@ VIDEO_AGG_PCT   = float(os.environ.get("NSFW_VIDEO_AGG_PCT", "1.0"))     # 1.0 =
 # ── Reliability (audit C1 — never leave a legit upload invisibly stuck) ─────────────────────────
 MAX_ATTEMPTS   = int(os.environ.get("NSFW_MAX_ATTEMPTS", "3"))   # then a terminal 'error' state
 LEASE_MINUTES  = int(os.environ.get("NSFW_LEASE_MINUTES", "10")) # 'processing' older than this → reclaimed to 'pending'
+# Grace before the ORPHAN loop may claim a pending video-post: gives /api/videos time to write the
+# Video row so a normal upload isn't scanned once as an orphan AND again by the video loop (2× cost).
+# A genuinely-orphaned post (Video enroll really failed) is still claimed once this elapses.
+ORPHAN_GRACE_SECONDS = int(os.environ.get("NSFW_ORPHAN_GRACE_SECONDS", "30"))
 
 # ── Poll cadence (image loop fast so a long video scan can't starve image publishes) ────────────
 IMAGE_POLL_SEC = float(os.environ.get("NSFW_IMAGE_POLL_SEC", "2.5"))

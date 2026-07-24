@@ -93,19 +93,25 @@ def claim_video():
 
 
 def claim_orphan_video_post():
-    """A post with a videoUrl but NO Video row (best-effort enroll failed) — both other loops miss it."""
+    """A post with a videoUrl but NO Video row (best-effort enroll failed) — both other loops miss it.
+    ORPHAN_GRACE_SECONDS skips the brief window between /api/posts/create and /api/videos writing the
+    Video row: without it a normal video-post is claimed HERE first, then AGAIN by the video loop once
+    the Video enrolls — two downloads + two vision passes for one upload. The NOT EXISTS guard already
+    skips posts that HAVE a Video row; the grace additionally skips the window BEFORE it exists. A
+    genuinely-orphaned post (enroll really failed) is still claimed once the grace elapses."""
     sql = f"""
         UPDATE "Post" SET "moderationLockedAt" = NOW()
         WHERE id = (
             SELECT p.id FROM "Post" p
             WHERE p."moderationStatus" = 'pending' AND p."videoUrl" IS NOT NULL AND p."videoUrl" <> ''
+              AND p."createdAt" < NOW() - (%s * INTERVAL '1 second')
               AND p."moderationAttempts" < %s AND {_LEASE.replace('"moderationLockedAt"', 'p."moderationLockedAt"')}
               AND NOT EXISTS (SELECT 1 FROM "Video" v WHERE v."postId" = p.id)
             ORDER BY p."createdAt" ASC LIMIT 1 FOR UPDATE SKIP LOCKED
         )
         RETURNING id, "userId", "videoUrl", "moderationAttempts"
     """
-    return _exec(sql, (config.MAX_ATTEMPTS, config.LEASE_MINUTES), fetch="one")
+    return _exec(sql, (config.ORPHAN_GRACE_SECONDS, config.MAX_ATTEMPTS, config.LEASE_MINUTES), fetch="one")
 
 
 def post_media_urls(post_id):
