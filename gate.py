@@ -117,7 +117,10 @@ def decide_video(agg, suspicious, api_key=None):
     hard_flag = None
     soft = []  # (img, scores, tripping_score) — elegance-band, worth vision
     for (img, sc) in suspicious:
-        h_status, h_label, h_score = config.hard_hit(sc)
+        # video=True: these are per-frame scores out of a 150-frame sample, so they are judged on the
+        # widened video band. Using the image thresholds here is what let the rarest false positive
+        # in a 150-frame tail decide an entire clip.
+        h_status, h_label, h_score = config.hard_hit(sc, video=True)
         if h_status == "rejected":
             return {"status": "rejected", "reason": f"nudity:{h_label}", "layer": "nudenet",
                     "scores": agg, "score": round(h_score or 0.0, 4), "vision_frames": 0}
@@ -125,7 +128,7 @@ def decide_video(agg, suspicious, api_key=None):
             if hard_flag is None:
                 hard_flag = (h_label, h_score)
             continue  # low-confidence nudity → review, not a vision candidate
-        nn_status, _, ts = config.verdict(sc)
+        nn_status, _, ts = config.verdict(sc, video=True)
         # A soft-BLOCK frame (confidently revealing — bikini / bare-midriff / shirtless) ALWAYS gets a
         # vision call: its block threshold can sit BELOW VIDEO_VISION_MIN, so the MIN gate must not
         # silently approve it. The soft-FLAG low-confidence noise tail stays MIN-gated (cost control).

@@ -160,7 +160,7 @@ class H(BaseHTTPRequestHandler):
                 with tempfile.NamedTemporaryFile(suffix=".mp4") as tf:
                     tf.write(body)
                     tf.flush()
-                    fr = frames.sample(tf.name)
+                    fr, _complete = frames.sample(tf.name)
                 if not fr:
                     self._send(200, json.dumps({"kind": "video", "error": "no frames sampled (is ffmpeg installed?)"}).encode())
                     return

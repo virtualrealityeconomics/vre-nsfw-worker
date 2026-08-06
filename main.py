@@ -129,7 +129,7 @@ def _scan_video(url):
     None = unscannable → retry (NEVER approve unseen)."""
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tf:
         r2.download_to(url, tf.name)
-        fr = frames.sample(tf.name)
+        fr, complete = frames.sample(tf.name)
     if not fr:
         return None
     per_frame, suspicious = {}, []
@@ -137,13 +137,16 @@ def _scan_video(url):
         sc = nsfw.detect_image(im)
         for lbl, v in sc.items():
             per_frame.setdefault(lbl, []).append(v)
-        if config.verdict(sc)[0] != "approved":
+        # video=True so "suspicious" is decided on the same band decide_video will judge it with.
+        # Mixing the two means frames that are perfectly fine under the video band still get carried
+        # into the decision path.
+        if config.verdict(sc, video=True)[0] != "approved":
             suspicious.append((im, sc))
     # `suspicious` is deliberately still built per-frame from the RAW scores: aggregation decides
     # the automatic verdict, but any individual frame that looked bad should still reach the vision
     # review pass. Loosening the aggregate must not also blind the second opinion.
     agg = _aggregate(per_frame, config.VIDEO_AGG_PCT)
-    return agg, suspicious, len(fr)
+    return agg, suspicious, len(fr), complete
 
 
 def _video_keys(row):
@@ -191,11 +194,18 @@ def process_video(row):
         if res is None:
             db.fail("Video", row["id"], row["moderationAttempts"])
             return
-        agg, suspicious, n = res
+        agg, suspicious, n, complete = res
         d = gate.decide_video(agg, suspicious)                    # clean → free; elegance band → vision
         t_status, t_scores, _media = _scan_thumbnail(row.get("postId"))   # CR2
         status = _worst(d["status"], t_status)
+        # Truncated sampling must never produce a clean pass: we did not see the whole clip, so
+        # "nothing found" is not evidence of nothing being there. Fail toward human review rather
+        # than either approving unseen footage or rejecting a video on partial evidence.
+        if not complete:
+            status = _worst(status, "flagged")
         labels = dict(agg); labels["_reason"] = d.get("reason", ""); labels["_layer"] = d.get("layer", "")
+        if not complete:
+            labels["_incomplete_coverage"] = True
         labels.update({"thumb_" + k: v for k, v in t_scores.items()})
         db.resolve_video(row["id"], row.get("postId"), status, round(d.get("score", 0.0), 4), labels)
     except Exception as e:
@@ -219,11 +229,17 @@ def process_orphan_video_post(row):
         if res is None:
             db.fail("Post", row["id"], row["moderationAttempts"])
             return
-        agg, suspicious, n = res
+        agg, suspicious, n, complete = res
         d = gate.decide_video(agg, suspicious)   # SFW → 'approved' publishes the raw MP4 (no transcode)
         t_status, t_scores, _media = _scan_thumbnail(row["id"])   # CR2
         status = _worst(d["status"], t_status)
+        # Same rule as the Video path, and it matters MORE here: an approved orphan post publishes
+        # the raw MP4 straight away, with no transcode step in between.
+        if not complete:
+            status = _worst(status, "flagged")
         labels = dict(agg); labels["_reason"] = d.get("reason", ""); labels["_layer"] = d.get("layer", "")
+        if not complete:
+            labels["_incomplete_coverage"] = True
         labels.update({"thumb_" + k: v for k, v in t_scores.items()})
         db.resolve_post(row["id"], status, round(d.get("score", 0.0), 4), labels)
     except Exception as e:
@@ -315,7 +331,11 @@ def _serve_metrics():
 
 
 def main():
-    print(f"[boot] nsfw-worker (NudeNet v3); block-thresholds={config.BLOCK_THRESHOLDS}", flush=True)
+    # Both bands are printed. There are now two, and a silently-wrong one is exactly how a chart
+    # video ended up rejected for nudity — if the numbers in the log look wrong, they ARE wrong.
+    print(f"[boot] nsfw-worker (NudeNet v3); IMAGE block={config.BLOCK_THRESHOLDS}", flush=True)
+    print(f"[boot] VIDEO block={config.VIDEO_BLOCK_THRESHOLDS}", flush=True)
+    print(f"[boot] VIDEO flag={config.VIDEO_FLAG_THRESHOLDS} agg_pct={config.VIDEO_AGG_PCT}", flush=True)
     if not config.DIRECT_URL:
         print("[boot] FATAL: DIRECT_URL unset", flush=True)
         sys.exit(1)
