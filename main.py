@@ -91,9 +91,40 @@ def process_image_post(row):
 
 
 # ── Video ─────────────────────────────────────────────────────────────────────────────────────────
+def _aggregate(per_frame, pct):
+    """Combine per-frame scores into one score per label.
+
+    pct=1.0 is MAX (any single frame decides). Anything lower takes that percentile across frames.
+
+    WHY THIS IS CONFIGURABLE, AND WHY MAX IS DANGEROUS ON LONG VIDEOS:
+    frames.sample() returns up to MAX_FRAMES (150) frames. Taking the MAX over 150 samples of a
+    detector with even a 1% per-frame false-positive rate rejects an ordinary video 78% of the time
+    (1 - 0.99**150) — the failure is arithmetic, not bad luck. Observed live: an 8-minute video of
+    GitHub star-history CHARTS was rejected on a single frame scoring 0.3414 for
+    MALE_GENITALIA_EXPOSED against a 0.30 threshold.
+
+    config.VIDEO_AGG_PCT has existed (and been documented in .env.example) since the worker was
+    written, but NOTHING EVER READ IT — this function is what makes the knob real. Setting it before
+    would have looked like a fix and changed nothing.
+    """
+    out = {}
+    for lbl, vals in per_frame.items():
+        if not vals:
+            continue
+        if pct >= 1.0 or len(vals) == 1:
+            out[lbl] = max(vals)
+        else:
+            s = sorted(vals)
+            # Nearest-rank percentile; index clamped so pct<1 always drops at least the top sample
+            # (otherwise a 150-frame video and a 3-frame video behave completely differently).
+            idx = min(len(s) - 1, max(0, int(round(pct * len(s))) - 1))
+            out[lbl] = s[idx]
+    return out
+
+
 def _scan_video(url):
     """Download → sample frames → per-frame NudeNet. Returns (agg, suspicious):
-        agg        = {label: max across all frames}   (for logs / persistence)
+        agg        = {label: aggregated across frames per config.VIDEO_AGG_PCT}
         suspicious = [(frame_img, frame_scores)] for frames NudeNet didn't clear (kept for the vision pass).
     None = unscannable → retry (NEVER approve unseen)."""
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tf:
@@ -101,14 +132,17 @@ def _scan_video(url):
         fr = frames.sample(tf.name)
     if not fr:
         return None
-    agg, suspicious = {}, []
+    per_frame, suspicious = {}, []
     for im in fr:
         sc = nsfw.detect_image(im)
         for lbl, v in sc.items():
-            if v > agg.get(lbl, 0.0):
-                agg[lbl] = v
+            per_frame.setdefault(lbl, []).append(v)
         if config.verdict(sc)[0] != "approved":
             suspicious.append((im, sc))
+    # `suspicious` is deliberately still built per-frame from the RAW scores: aggregation decides
+    # the automatic verdict, but any individual frame that looked bad should still reach the vision
+    # review pass. Loosening the aggregate must not also blind the second opinion.
+    agg = _aggregate(per_frame, config.VIDEO_AGG_PCT)
     return agg, suspicious, len(fr)
 
 
