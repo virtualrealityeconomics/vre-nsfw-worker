@@ -136,3 +136,42 @@ def list_prefix(prefix):
         else:
             break
     return keys
+
+
+# ── Private staging bucket ────────────────────────────────────────────────────────────────────────
+# Cover images awaiting a verdict live here and have NO public URL, so they are read through the S3
+# API by key rather than over HTTP. That is the point: a rejected cover never reached public storage,
+# so unlike the quarantine path there is nothing to take down afterwards.
+PRIVATE_BUCKET = config.R2_PRIVATE_BUCKET
+
+
+def fetch_private(key, max_bytes=None):
+    """Read an object out of the private bucket. Same size cap as fetch_public — a decompression
+    bomb is just as dangerous whichever bucket it came from."""
+    c = _client()
+    obj = c.get_object(Bucket=PRIVATE_BUCKET, Key=key)
+    body = obj["Body"]
+    data = bytearray()
+    while True:
+        chunk = body.read(65536)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if max_bytes and len(data) > max_bytes:
+            raise ValueError("media exceeds max bytes")
+    return bytes(data)
+
+
+def delete_private(keys):
+    """Hard-delete from the private bucket — a rejected cover, or a swept orphan."""
+    c = _client()
+    n = 0
+    for key in keys or []:
+        if not key:
+            continue
+        try:
+            c.delete_object(Bucket=PRIVATE_BUCKET, Key=key)
+            n += 1
+        except Exception as e:
+            print(f"[r2] private delete failed {key}: {type(e).__name__}: {e}", flush=True)
+    return n

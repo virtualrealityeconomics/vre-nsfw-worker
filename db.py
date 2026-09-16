@@ -234,3 +234,53 @@ def metrics():
     ) or {}
     out["backlog"] = {"images": r.get("image_backlog", 0), "videos": r.get("video_backlog", 0)}
     return out
+
+
+# ── MediaScan: pre-publish cover images for services/bounties ─────────────────────────────────────
+# Separate from the Post/Video loops because the verdict is needed BEFORE the record exists — the
+# uploader is sitting in a modal waiting for it, so this is the one surface where latency is visible.
+def claim_media_scan():
+    sql = f"""
+        UPDATE "MediaScan" SET "lockedAt" = NOW()
+        WHERE id = (
+            SELECT id FROM "MediaScan"
+            WHERE status = 'pending' AND attempts < %s
+              AND ("lockedAt" IS NULL OR "lockedAt" < NOW() - (%s * INTERVAL '1 minute'))
+            ORDER BY "createdAt" ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, key, "keySmall", attempts
+    """
+    return _exec(sql, (config.MAX_ATTEMPTS, config.LEASE_MINUTES), fetch="one")
+
+
+def resolve_media_scan(scan_id, status, score, labels):
+    """Write the verdict and release the lease.
+
+    psycopg2.extras.Json is spelled out deliberately — a bare Json(...) is a NameError here, and
+    because this runs inside the loop's broad except it would leave the row 'pending' with its lease
+    held: re-claimed every LEASE_MINUTES, failing identically, forever. The uploader's modal would
+    poll a verdict that could never arrive.
+    """
+    _exec(
+        'UPDATE "MediaScan" SET status=%s, score=%s, labels=%s, "scannedAt"=NOW(), "lockedAt"=NULL '
+        'WHERE id=%s',
+        (status, score, psycopg2.extras.Json(labels) if labels is not None else None, scan_id),
+    )
+
+
+def fail_media_scan(scan_id, current_attempts):
+    """Cannot reuse fail(): that hardcodes moderationAttempts/moderationStatus/moderatedAt/
+    moderationLockedAt, and MediaScan uses attempts/status/scannedAt/lockedAt — the column names
+    simply do not exist here."""
+    _exec(
+        'UPDATE "MediaScan" SET attempts=attempts+1, '
+        'status=CASE WHEN attempts+1 >= %s THEN \'error\' ELSE status END, '
+        '"scannedAt"=CASE WHEN attempts+1 >= %s THEN NOW() ELSE "scannedAt" END, '
+        '"lockedAt"=NULL WHERE id=%s',
+        (config.MAX_ATTEMPTS, config.MAX_ATTEMPTS, scan_id),
+    )
+
+
+def media_scan_backlog():
+    r = _exec('SELECT COUNT(*) AS n FROM "MediaScan" WHERE status=\'pending\'', fetch="one") or {}
+    return r.get("n", 0)

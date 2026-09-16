@@ -256,6 +256,63 @@ def process_orphan_video_post(row):
 
 
 # ── Loops ─────────────────────────────────────────────────────────────────────────────────────────
+def process_media_scan(row):
+    """One cover image awaiting a verdict, uploaded by someone sitting in a modal right now.
+
+    Reads from the PRIVATE bucket by key — these bytes have no public URL, which is the whole point:
+    a rejected cover never touched public storage, so there is nothing to take down afterwards.
+    """
+    t0 = time.time()
+    try:
+        data = r2.fetch_private(row["key"], max_bytes=config.MAX_IMAGE_BYTES)
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        d = gate.decide_image(im, api_key=config.ANTHROPIC_API_KEY, free_block=True)
+    except Exception as e:
+        _log(f"[scan] failed id={row['id']}: {type(e).__name__}: {e}")
+        db.fail_media_scan(row["id"], row["attempts"])
+        return
+
+    status = d["status"]
+    # `flagged` needs splitting, and getting this wrong takes the whole feature down.
+    #
+    # gate.decide_image degrades FAIL-CLOSED: when the vision call errors it returns 'flagged' with
+    # layer='fallback'. So during an Anthropic outage EVERY storefront upload would come back
+    # flagged, and a naive pass-through would tell every user their image "was not approved" while
+    # silently blocking all service and bounty creation platform-wide.
+    if d.get("layer") == "fallback":
+        status = "error"          # our problem, not theirs — retryable, and the modal says so
+    elif status == "flagged":
+        # There is no human review queue for this surface (unlike Post/Video), so a hold nobody can
+        # release is a dead end. Treat it as not-publishable and let them pick another image.
+        status = "rejected"
+
+    labels = dict(d.get("scores") or {})
+    labels["_reason"] = d.get("reason", "")
+    labels["_layer"] = d.get("layer", "")
+    db.resolve_media_scan(row["id"], status, round(d.get("score", 0.0) or 0.0, 4), labels)
+
+    # Nothing was ever public, so a rejection is a plain delete rather than a quarantine.
+    if status != "approved":
+        r2.delete_private([row["key"], row.get("keySmall")])
+
+    _log(f"[scan] {row['id']} -> {status.upper()} [{d.get('layer')}:{d.get('reason','')}] "
+         f"{time.time()-t0:.1f}s")
+
+
+def media_scan_loop():
+    """Own thread, on the IMAGE cadence. Deliberately not folded into image_loop: a 17-minute video
+    scan must never sit in front of someone waiting in a modal."""
+    while not _stop.is_set():
+        try:
+            row = db.claim_media_scan()
+            if row:
+                process_media_scan(row)
+                continue
+        except Exception:
+            traceback.print_exc()
+        _stop.wait(config.IMAGE_POLL_SEC)
+
+
 def image_loop():
     while not _stop.is_set():
         try:
@@ -343,6 +400,7 @@ def main():
     threading.Thread(target=_serve_metrics, daemon=True).start()
     threading.Thread(target=image_loop, daemon=True).start()
     threading.Thread(target=video_loop, daemon=True).start()
+    threading.Thread(target=media_scan_loop, daemon=True).start()
     print(f"[boot] loops running; /metrics on :{config.METRICS_PORT}", flush=True)
     try:
         while not _stop.is_set():

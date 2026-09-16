@@ -14,6 +14,10 @@ R2_ENDPOINT       = os.environ.get("R2_ENDPOINT", "")
 R2_ACCESS_KEY_ID  = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME    = os.environ.get("R2_BUCKET_NAME", "")
+# Staging bucket for bytes that must not be public before a verdict (service/bounty covers).
+# A separate BUCKET, not a prefix: the quarantine/ prefix on the public bucket is itself
+# publicly readable, so prefixing a key changes the URL without changing who can read it.
+R2_PRIVATE_BUCKET = os.environ.get("R2_PRIVATE_BUCKET_NAME", "vre-media-private")
 MEDIA_BASE        = os.environ.get("MEDIA_BASE", "https://media.vre.pro/")  # public URL prefix → key
 QUARANTINE_PREFIX = os.environ.get("QUARANTINE_PREFIX", "quarantine/")       # blocked bytes move HERE (kept, not deleted)
 
