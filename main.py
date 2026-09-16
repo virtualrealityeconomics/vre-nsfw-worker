@@ -150,13 +150,55 @@ def _scan_video(url):
 
 
 def _video_keys(row):
-    """The column-derived keys — source, preview, posters. These go to the quarantine prefix, which the
+    """The column-derived keys — source and posters. These go to the quarantine prefix, which the
     admin dashboard signs a read of so a human can judge an appeal.
 
-    Note the pre-versioning preview (videos/previews/<id>-preview.mp4) is reached ONLY through the
-    previewUrl column here; it sits outside the versioned prefix _video_tree_keys lists.
+    The pre-versioning preview (videos/previews/<id>-preview.mp4) is named here too, because it sits
+    outside the versioned prefix _video_tree_keys lists — but DERIVED from the id, not read from
+    previewUrl, which is null for long stretches while the file it named lives on.
     """
-    return [r2.url_to_key(row.get(k)) for k in ("videoUrl", "previewUrl", "thumbnailUrl", "thumbnailSmallUrl", "hlsUrl")]
+    keys = [r2.url_to_key(row.get(k)) for k in ("videoUrl", "thumbnailUrl", "thumbnailSmallUrl")]
+    # ⚠️ previewUrl and hlsUrl are deliberately NOT read from their columns here.
+    #
+    # quarantine_keys runs FIRST, and that prefix is on the PUBLIC bucket. Taking the current preview
+    # and master.m3u8 from their columns would copy them there — and move_to_private, running after,
+    # would no longer find them. The result is the same object under two policies decided by which
+    # call ran first: the superseded versions end up private while the CURRENT one stays publicly
+    # readable at a derivable address, which is the worse half.
+    #
+    # The versioned shapes are swept by prefix in _video_tree_keys. Only the pre-versioning FLAT
+    # preview needs naming, because it sits outside every prefix — derived, not read from the column,
+    # for the same reason the ladder is: the column is null for long stretches. Mirrors vre-life.
+    vid = row.get("id")
+    if vid:
+        keys.append(f"videos/previews/{vid}-preview.mp4")
+    return keys
+
+
+def _take_down_video(row, thumb_keys):
+    """Move every public byte of a refused video out of reach.
+
+    A function rather than inline, so a test can drive it: the alternative is grepping main.py for the
+    call, which sees POSITION and not control flow — dedent the sweep out of the `rejected` branch and
+    a text check still passes while approved videos get taken down.
+
+    Two destinations, deliberately. The column-derived keys go to the quarantine prefix, which the
+    admin dashboard signs a read of so a human can judge an appeal. The streaming tree goes to the
+    PRIVATE bucket, because that prefix lives on the PUBLIC bucket and a set of streaming pieces copied
+    there is a working video at a derivable address, not an obscure link.
+    """
+    r2.quarantine_keys(_video_keys(row) + thumb_keys)
+
+    # ⚠️ The count is checked. Unlike quarantine_keys — which force-deletes the public copy when a copy
+    # fails, so nothing is ever left readable — this mover leaves the object alone and returns a
+    # number. The verdict is already terminal by now and nothing retries this row, so a quiet shortfall
+    # is a permanent public leak.
+    tree = _video_tree_keys(row)
+    moved = r2.move_to_private(tree)
+    if moved != len(tree):
+        _log(f"[video] 🔴 TAKEDOWN INCOMPLETE id={row.get('id')}: {moved}/{len(tree)} moved — "
+             f"the rest are STILL PUBLIC and nothing will retry this row")
+    return moved
 
 
 def _video_tree_keys(row):
@@ -240,10 +282,7 @@ def process_video(row):
         return
     if status == "rejected":
         thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row.get("postId")) or [])]
-        r2.quarantine_keys(_video_keys(row) + thumb_keys)
-        # The streaming tree goes to the PRIVATE bucket, not the public quarantine prefix — see
-        # _video_tree_keys. Kept as a separate call so a failure moving one set cannot hide the other.
-        r2.move_to_private(_video_tree_keys(row))
+        _take_down_video(row, thumb_keys)
     ctx = db.describe(row.get("postId"))
     _log(f'[video] "{ctx["title"]}" by {ctx["author"]} · {_fname(row["videoUrl"])} · {n}f/{len(suspicious)}susp · '
          f'v={_top(agg)}[{d.get("layer")}:{d.get("reason","")}] vision={d.get("vision_frames",0)} thumb={t_status} '
