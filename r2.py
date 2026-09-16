@@ -162,6 +162,43 @@ def fetch_private(key, max_bytes=None):
     return bytes(data)
 
 
+def move_to_private(keys):
+    """Copy each key into the PRIVATE bucket, then delete the public copy. Missing keys skipped.
+
+    Why not quarantine_keys: that prefix is on the PUBLIC bucket, so it changes an object's address
+    without changing who can read it. For a lone MP4 that is an obscure link. For an HLS tree it is a
+    complete, working stream — ffmpeg writes bare relative filenames into each variant playlist, so
+    the whole set copied under quarantine/ plays perfectly at an address derivable from the original.
+    The private bucket has no unsigned read path at all.
+
+    vre-life's human reject already routes the ladder this way; this keeps the automatic path in step.
+    """
+    c = _client()
+    moved = 0
+    for key in keys:
+        if not key:
+            continue
+        try:
+            c.copy_object(
+                Bucket=PRIVATE_BUCKET,
+                CopySource={"Bucket": config.R2_BUCKET_NAME, "Key": key},
+                Key=key,
+            )
+            # Copy first, delete second, per key — a crash can never lose the only copy.
+            c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
+            moved += 1
+        except Exception as e:
+            code = ""
+            resp = getattr(e, "response", None)
+            if isinstance(resp, dict):
+                code = resp.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404", "NotFound"):
+                moved += 1      # already gone from public = already moved; a re-run finishes a partial sweep
+                continue
+            print(f"[r2] move_to_private failed {key}: {type(e).__name__}: {e}", flush=True)
+    return moved
+
+
 def delete_private(keys):
     """Hard-delete from the private bucket — a rejected cover, or a swept orphan."""
     c = _client()

@@ -150,11 +150,37 @@ def _scan_video(url):
 
 
 def _video_keys(row):
-    keys = [r2.url_to_key(row.get(k)) for k in ("videoUrl", "previewUrl", "thumbnailUrl", "thumbnailSmallUrl", "hlsUrl")]
-    hls = r2.url_to_key(row.get("hlsUrl"))
-    if hls and "/" in hls:  # sweep the whole HLS dir (variable .ts segment count)
-        keys += r2.list_prefix(hls.rsplit("/", 1)[0] + "/")
-    return keys
+    """The column-derived keys — source, preview, posters. These go to the quarantine prefix, which the
+    admin dashboard signs a read of so a human can judge an appeal.
+
+    Note the pre-versioning preview (videos/previews/<id>-preview.mp4) is reached ONLY through the
+    previewUrl column here; it sits outside the versioned prefix _video_tree_keys lists.
+    """
+    return [r2.url_to_key(row.get(k)) for k in ("videoUrl", "previewUrl", "thumbnailUrl", "thumbnailSmallUrl", "hlsUrl")]
+
+
+def _video_tree_keys(row):
+    """The HLS ladder and the versioned previews, listed from the bucket and keyed on the VIDEO ID.
+
+    ▶ Keyed on the id, never on hlsUrl. This used to be hlsUrl.rsplit("/", 1)[0] — the directory
+      holding master.m3u8. Two ways that breaks: hlsUrl is NULL for long stretches, and since
+      vre-video-worker began writing each transcode to videos/hls/<id>/<version>/ that expression
+      names the CURRENT version only, leaving every superseded one publicly readable for ever. The id
+      covers every version and every layout, including the pre-versioning one.
+
+    ▶ Separate from _video_keys because these go somewhere ELSE — the private bucket, not the public
+      quarantine prefix. See r2.move_to_private.
+
+    ⚠️ UNREACHABLE TODAY, and that is why this is defence in depth rather than a fix. claim_video
+      takes rows at moderationStatus='pending', which is BEFORE the transcode worker will touch them
+      (it requires 'approved'), and nothing anywhere resets a ready video to pending. So when this
+      loop sees a row, both prefixes are empty and hlsUrl is null. It must be correct before anything
+      makes that path live, not after.
+    """
+    vid = row.get("id")
+    if not vid:
+        return []
+    return r2.list_prefix(f"videos/hls/{vid}/") + r2.list_prefix(f"videos/previews/{vid}/")
 
 
 _RANK = {"approved": 0, "flagged": 1, "rejected": 2, "error": 3}
@@ -215,6 +241,9 @@ def process_video(row):
     if status == "rejected":
         thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row.get("postId")) or [])]
         r2.quarantine_keys(_video_keys(row) + thumb_keys)
+        # The streaming tree goes to the PRIVATE bucket, not the public quarantine prefix — see
+        # _video_tree_keys. Kept as a separate call so a failure moving one set cannot hide the other.
+        r2.move_to_private(_video_tree_keys(row))
     ctx = db.describe(row.get("postId"))
     _log(f'[video] "{ctx["title"]}" by {ctx["author"]} · {_fname(row["videoUrl"])} · {n}f/{len(suspicious)}susp · '
          f'v={_top(agg)}[{d.get("layer")}:{d.get("reason","")}] vision={d.get("vision_frames",0)} thumb={t_status} '
