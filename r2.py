@@ -1,9 +1,12 @@
 """R2 access: fetch media from the PUBLIC url (no creds), and QUARANTINE blocked bytes.
 
-Quarantine, never hard-delete (audit C3 + never-hard-delete rule): copy the object to a private
-`quarantine/` prefix, THEN delete the public-domain copy — so the URL 404s but the bytes survive
-for appeal/restore. If the copy fails we still delete the public copy (an NSFW object must not stay
-public), logging loudly.
+Quarantine, never hard-delete (audit C3 + never-hard-delete rule): copy the object to the PRIVATE
+bucket under a `quarantine/` prefix, THEN delete the public-domain copy — so the URL 404s but the
+bytes survive for appeal/restore.
+
+⚠️ The quarantine used to live under that prefix on the PUBLIC bucket, which changed an object's
+address without changing who could read it: 137 objects sat there readable by anyone who could derive
+the URL, held back only by a Cloudflare rule. The prefix is unchanged; only the bucket moved.
 """
 import boto3
 import requests
@@ -64,34 +67,85 @@ def download_to(url, path, max_bytes=None):
     return total
 
 
+def _private_object_exists(c, key):
+    """Is the object actually in the private bucket? Used to decide whether a public copy is redundant.
+
+    boto3 raises ClientError with Code "404" for a missing KEY on head_object — NOT "NoSuchKey" and NOT
+    "NotFound". A literal port of the JS predicate would never return True, so the gate would always say
+    "not there" and nothing would ever be cleaned up.
+
+    Catching Exception, not ClientError: botocore's connection failures (EndpointConnectionError and
+    friends) are BotoCoreError, NOT ClientError, so a narrow catch would let a network blip escape a
+    function whose whole job is to answer yes or no. Any error at all -> False -> do not delete. A
+    missing bucket, a permissions problem and a genuinely absent object all mean the same thing here:
+    we have no proof the bytes are safe anywhere else.
+    """
+    try:
+        c.head_object(Bucket=config.R2_PRIVATE_BUCKET, Key=key)
+        return True
+    except Exception:                                   # noqa: BLE001 — see below
+        return False
+
+
 def quarantine_keys(keys):
-    """Copy each key to the quarantine prefix, then delete the public copy. Missing keys skipped."""
+    """Copy each key into the PRIVATE bucket's quarantine prefix, then delete the public copy.
+
+    ⛔ THE DELETE IS EARNED, NOT ASSUMED. This used to force-delete the public copy on ANY error, which
+    was safe while the copy was within one bucket — the only thing that can be missing then is the
+    source key. Cross-bucket, the same error class also means the destination is missing or unwritable,
+    and the old test could not tell them apart. Measured against real R2:
+
+        a valid-but-absent bucket -> NoSuchBucket, "The specified bucket does not exist."
+            ...the old substring test matched -> `continue` -> the NSFW bytes stayed PUBLIC
+        an invalid bucket name    -> InvalidBucketName
+            ...it did not match   -> the force-delete fired -> THE ONLY COPY WAS DESTROYED
+
+    A coin flip between leaving blocked content public and destroying a user's media. So: match on the
+    error CODE, never the message string, and delete only once the bytes are provably somewhere else.
+    Leaving an NSFW object public for a few more minutes is recoverable; deleting the only copy is not,
+    and this project never hard-deletes.
+    """
     c = _client()
-    moved = 0
+    moved = already_gone = failed = 0
+    errors = []
     for key in keys:
         if not key:
             continue
         dest = config.QUARANTINE_PREFIX + key
         try:
             c.copy_object(
-                Bucket=config.R2_BUCKET_NAME,
+                Bucket=config.R2_PRIVATE_BUCKET,
                 CopySource={"Bucket": config.R2_BUCKET_NAME, "Key": key},
                 Key=dest,
             )
             c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
             moved += 1
-        except Exception as e:
-            # Benign + expected: the source is already quarantined (public copy gone) → NoSuchKey. The bytes
-            # are already non-public, nothing to do. Any OTHER error → force-delete so nothing stays public.
-            msg = str(e)
-            if "NoSuchKey" in msg or "does not exist" in msg:
+        except Exception as e:                          # noqa: BLE001
+            # Exception, not ClientError: botocore raises EndpointConnectionError and similar for
+            # network failures, and those are NOT ClientError. A narrow catch would crash the worker
+            # loop on a blip — the old code caught broadly and that part was right.
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            # On the CODE. "The specified bucket does not exist" contains "does not exist" too, which is
+            # exactly how a whole-configuration failure used to read as "this one object was already done".
+            if code == "NoSuchKey":
+                already_gone += 1
                 continue
-            print(f"[r2] quarantine {key} failed ({type(e).__name__}: {e}); force-deleting public copy", flush=True)
-            try:
-                c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
-            except Exception:
-                pass
-    return moved
+            if _private_object_exists(c, dest):
+                # The copy DID land; the public copy is redundant. Only count it moved if the delete
+                # actually succeeds — otherwise the object is still at its public URL and saying
+                # "moved" is the lie this rewrite exists to remove.
+                try:
+                    c.delete_object(Bucket=config.R2_BUCKET_NAME, Key=key)
+                    moved += 1
+                except Exception as de:                 # noqa: BLE001
+                    failed += 1
+                    errors.append(f"{key}: copied but not deleted: {de}")
+                    print(f"[r2] quarantine copied but PUBLIC COPY REMAINS {key}: {de}", flush=True)
+                continue
+            failed += 1
+            errors.append(f"{key}: {e}")
+            print(f"[r2] quarantine FAILED, object left PUBLIC: {key}: {e}", flush=True)
+    return {"moved": moved, "already_gone": already_gone, "failed": failed, "errors": errors}
 
 
 def un_quarantine_keys(keys):

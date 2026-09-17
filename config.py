@@ -19,7 +19,15 @@ R2_BUCKET_NAME    = os.environ.get("R2_BUCKET_NAME", "")
 # publicly readable, so prefixing a key changes the URL without changing who can read it.
 R2_PRIVATE_BUCKET = os.environ.get("R2_PRIVATE_BUCKET_NAME", "vre-media-private")
 MEDIA_BASE        = os.environ.get("MEDIA_BASE", "https://media.vre.pro/")  # public URL prefix → key
-QUARANTINE_PREFIX = os.environ.get("QUARANTINE_PREFIX", "quarantine/")       # blocked bytes move HERE (kept, not deleted)
+# Blocked bytes move HERE (kept, never deleted) — into the PRIVATE bucket under this prefix.
+# `or` rather than a default argument: os.environ.get(k, default) returns "" when the var is SET but
+# empty, and an empty prefix would write into the private bucket at the ORIGINAL key — the namespace
+# holding paid video sources and sold market files — overwriting a product someone paid for and then
+# deleting the public original. Normalised to end in "/" and refused if it names a live namespace.
+_qp = os.environ.get("QUARANTINE_PREFIX") or "quarantine/"
+QUARANTINE_PREFIX = _qp if _qp.endswith("/") else _qp + "/"
+if QUARANTINE_PREFIX.split("/")[0] in ("videos", "images", "market-src", "staging", "service-covers"):
+    raise RuntimeError(f"QUARANTINE_PREFIX {QUARANTINE_PREFIX!r} collides with a live media namespace")
 
 # ── Model: NudeNet v3 via the MIT `nudenet` package (320n.onnx bundled in the wheel; onnxruntime) ─
 

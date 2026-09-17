@@ -83,7 +83,7 @@ def process_image_post(row):
     if status == "rejected":
         keys = [r2.url_to_key(u) for u in (row.get("mediaUrls") or [])
                 + (row.get("mediaUrlsSmall") or []) + (row.get("mediaUrlsMedium") or [])]
-        r2.quarantine_keys(keys)
+        _report_quarantine(r2.quarantine_keys(keys), "image", row["id"])
     ctx = db.describe(row["id"])
     _log(f'[image] "{ctx["title"]}" by {ctx["author"]} · {_fname(urls[0] if urls else "")} · '
          f'{_top(d.get("scores") or {})}[{d.get("layer")}:{d.get("reason","")}] '
@@ -160,7 +160,8 @@ def _video_keys(row):
     keys = [r2.url_to_key(row.get(k)) for k in ("videoUrl", "thumbnailUrl", "thumbnailSmallUrl")]
     # ⚠️ previewUrl and hlsUrl are deliberately NOT read from their columns here.
     #
-    # quarantine_keys runs FIRST, and that prefix is on the PUBLIC bucket. Taking the current preview
+    # quarantine_keys runs FIRST. Its prefix is on the private bucket now, but the split still matters:
+    # taking the current preview
     # and master.m3u8 from their columns would copy them there — and move_to_private, running after,
     # would no longer find them. The result is the same object under two policies decided by which
     # call ran first: the superseded versions end up private while the CURRENT one stays publicly
@@ -175,6 +176,25 @@ def _video_keys(row):
     return keys
 
 
+def _report_quarantine(res, kind, row_id):
+    """A quarantine that could not move everything now LEAVES THE BYTES PUBLIC. Say so, loudly.
+
+    This used to be safe to ignore: the old code force-deleted the public copy whenever a copy failed,
+    so a failure could not leave anything readable. It can now — deliberately, because cross-bucket the
+    alternative was destroying the only copy — which means the shortfall has to be reported instead.
+    The verdict is already terminal by the time this runs and nothing re-polls a rejected row, so an
+    unreported failure is a permanent public leak of content a model just blocked.
+    """
+    if not res or not res.get("failed"):
+        return
+    _log(f"[{kind}] 🔴 QUARANTINE INCOMPLETE id={row_id}: {res['failed']} key(s) STILL PUBLIC "
+         f"({'; '.join(res.get('errors') or [])[:300]}) — nothing will retry this row")
+    # A print() on this box reaches nobody. The row is what an operator actually sees: the approval
+    # app counts every pending EscrowEvent whose type starts with `alert_`.
+    db.alert_once("alert_quarantine_incomplete", row_id,
+                  {"kind": kind, "failed": res.get("failed"), "errors": (res.get("errors") or [])[:5]})
+
+
 def _take_down_video(row, thumb_keys):
     """Move every public byte of a refused video out of reach.
 
@@ -183,16 +203,17 @@ def _take_down_video(row, thumb_keys):
     a text check still passes while approved videos get taken down.
 
     Two destinations, deliberately. The column-derived keys go to the quarantine prefix, which the
-    admin dashboard signs a read of so a human can judge an appeal. The streaming tree goes to the
-    PRIVATE bucket, because that prefix lives on the PUBLIC bucket and a set of streaming pieces copied
-    there is a working video at a derivable address, not an obscure link.
+    admin dashboard signs a read of so a human can judge an appeal. Both destinations are the PRIVATE
+    bucket now — the quarantine prefix moved there too — but they stay separate calls so a failure in
+    one cannot hide the other, and so the ladder is never split from its own master playlist.
     """
-    r2.quarantine_keys(_video_keys(row) + thumb_keys)
+    _report_quarantine(r2.quarantine_keys(_video_keys(row) + thumb_keys), "video", row.get("id"))
 
-    # ⚠️ The count is checked. Unlike quarantine_keys — which force-deletes the public copy when a copy
-    # fails, so nothing is ever left readable — this mover leaves the object alone and returns a
-    # number. The verdict is already terminal by now and nothing retries this row, so a quiet shortfall
-    # is a permanent public leak.
+    # ⚠️ The count is checked — and so is quarantine_keys' above, now. BOTH movers leave the object
+    # alone when they cannot prove the bytes landed elsewhere, because the alternative (force-deleting
+    # the public copy on any error) destroys the only copy the moment a destination bucket is
+    # misconfigured. The verdict is already terminal by now and nothing retries this row, so a quiet
+    # shortfall in either is a permanent public leak.
     tree = _video_tree_keys(row)
     moved = r2.move_to_private(tree)
     if moved != len(tree):
@@ -316,7 +337,8 @@ def process_orphan_video_post(row):
         return
     if status == "rejected":
         thumb_keys = [r2.url_to_key(u) for u in (db.post_media_all_urls(row["id"]) or [])]
-        r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))] + thumb_keys)
+        _report_quarantine(
+            r2.quarantine_keys([r2.url_to_key(row.get("videoUrl"))] + thumb_keys), "orphan", row["id"])
     ctx = db.describe(row["id"])
     _log(f'[orphan] "{ctx["title"]}" by {ctx["author"]} · {_fname(row["videoUrl"])} · {n}f/{len(suspicious)}susp · '
          f'v={_top(agg)}[{d.get("layer")}:{d.get("reason","")}] vision={d.get("vision_frames",0)} thumb={t_status} '

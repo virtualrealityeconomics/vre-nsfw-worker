@@ -15,7 +15,9 @@ Agreed flow (differs from the original audit, deliberately):
   ORPHAN video post (video enroll failed → no Video row) → scan Post.videoUrl directly; SFW → Post
                 'approved' (plays raw MP4, no HLS); NSFW → 'rejected'.
 """
+import json
 import threading
+import uuid
 
 import psycopg2
 import psycopg2.extras
@@ -57,6 +59,44 @@ def _exec(sql, params=None, fetch=None):
             _local.conn = None
             if attempt == 2:
                 raise
+
+
+def alert_once(event_type, reference_id, metadata=None):
+    """Write a pending EscrowEvent unless one is already open for this (eventType, referenceId).
+
+    ▶ WHY THE WORKER NEEDS THIS. A quarantine that cannot move its bytes now LEAVES THEM PUBLIC —
+    deliberately, because the alternative (force-deleting the public copy on any error) destroys the
+    only copy the moment a destination bucket is misconfigured. But the verdict is already committed by
+    then and nothing re-polls a rejected row, so without a durable record the only trace is a print()
+    on a box with no log alerting: a permanent public leak of content a model just blocked, that nobody
+    would ever learn about.
+
+    Mirrors vre-life's lib/alerts.js alertOnce, including the dedupe-while-pending so a repeated
+    failure on one row cannot spam the console. The `alert_` prefix is REQUIRED: the approval app's
+    catch-all is `WHERE "eventType" LIKE 'alert\\_%'`, so a type without it is written and displayed
+    by nothing — which is the "alert that never fired and nobody noticed for a month" this project has
+    already had once.
+
+    The id is generated here: Prisma's @default(uuid()) is client-side, so the column has NO database
+    default (verified against production) and a raw INSERT must supply one.
+
+    Never raises: an alert that fails must not take down the scan loop that raised it.
+    """
+    try:
+        open_row = _exec(
+            'SELECT id FROM "EscrowEvent" WHERE "eventType"=%s AND "referenceId"=%s AND status=%s LIMIT 1',
+            (event_type, str(reference_id), "pending"), fetch="one")
+        if open_row:
+            return False
+        _exec(
+            'INSERT INTO "EscrowEvent" (id,"escrowType","referenceId","eventType",status,"initiatedBy",metadata)'
+            " VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            (str(uuid.uuid4()), "reconcile", str(reference_id), event_type, "pending", "worker",
+             json.dumps(metadata or {})))
+        return True
+    except Exception as e:                              # noqa: BLE001
+        print(f"[db] alert_once failed ({event_type} {reference_id}): {e}", flush=True)
+        return False
 
 
 # Lease predicate: unlocked OR the lease expired (crashed worker) → re-claimable.

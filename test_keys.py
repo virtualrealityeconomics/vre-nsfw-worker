@@ -142,6 +142,7 @@ import importlib.util
 spec = importlib.util.spec_from_file_location("realr2", "r2.py")
 # config is stubbed above; give the real module what it reads.
 sys.modules["config"].R2_BUCKET_NAME = "pub"
+sys.modules["config"].QUARANTINE_PREFIX = "quarantine/"
 sys.modules["config"].R2_PRIVATE_BUCKET = "priv"
 sys.modules["config"].R2_ENDPOINT = "http://127.0.0.1:1"
 sys.modules["config"].R2_ACCESS_KEY_ID = "x"
@@ -172,7 +173,20 @@ try:
         check(f"{k} is copied before it is deleted", ci < di, ops)
 
     class Boom(Exception):
+        # The str() has to be boto3's REAL sentence. The old predicate tested the message with
+        # `"does not exist" in msg`, and a Boom whose str() is just "NoSuchBucket" cannot trigger it —
+        # so a test asserting "a wrong BUCKET does NOT count as moved" would pass even with the old
+        # buggy predicate restored. The fixture has to carry the real text or it guards nothing.
+        _TEXT = {
+            "NoSuchBucket": "The specified bucket does not exist",
+            "NoSuchKey": "The specified key does not exist.",
+            "404": "Not Found",
+        }
+
         def __init__(self, code):
+            super().__init__(
+                f"An error occurred ({code}) when calling the CopyObject operation: "
+                f"{self._TEXT.get(code, code)}")
             self.response = {"Error": {"Code": code}}
 
     class FailS3(FakeS3):
@@ -187,6 +201,81 @@ try:
     f.code = "NoSuchBucket"
     check("a wrong BUCKET does NOT count as moved", realr2.move_to_private(["a.ts"]) == 0,
           "a misconfigured destination would report a clean takedown of bytes still public")
+    # ── quarantine_keys, the high-volume path — and the one that can now LOSE BYTES ────────────
+    ops.clear()
+
+    class QFake(FakeS3):
+        """A copy that fails, with a switchable error code and a switchable head_object answer."""
+        code = "NoSuchKey"
+        head_ok = False
+        copy_ok = False
+        delete_raises = False
+
+        def copy_object(self, **kw):
+            if self.copy_ok:
+                return FakeS3.copy_object(self, **kw)
+            raise Boom(self.code)
+
+        def head_object(self, **kw):
+            ops.append(("head", kw["Bucket"], kw["Key"]))
+            if not self.head_ok:
+                raise Boom("404")
+
+        def delete_object(self, **kw):
+            if self.delete_raises:
+                raise Boom("AccessDenied")
+            FakeS3.delete_object(self, **kw)
+
+    q = QFake()
+    realr2._client = lambda: q
+
+    # the happy path
+    q.copy_ok = True
+    ops.clear()
+    r = realr2.quarantine_keys(["x.jpg"])
+    check("quarantine copies to the PRIVATE bucket",
+          any(o[0] == "copy" and o[1] == "priv" for o in ops), ops)
+    check("quarantine deletes from the PUBLIC bucket",
+          any(o[0] == "delete" and o[1] == "pub" for o in ops), ops)
+    check("a clean quarantine reports moved=1, failed=0", r["moved"] == 1 and r["failed"] == 0, r)
+
+    # a source that is already gone
+    q.copy_ok = False
+    q.code = "NoSuchKey"
+    ops.clear()
+    r = realr2.quarantine_keys(["x.jpg"])
+    check("an already-gone source is not a failure", r["failed"] == 0 and r["already_gone"] == 1, r)
+    check("...and nothing is deleted for it", not any(o[0] == "delete" for o in ops), ops)
+
+    # 🔴 THE ONE THAT MATTERS: a misconfigured destination must NOT destroy the only copy
+    q.code = "NoSuchBucket"
+    q.head_ok = False
+    ops.clear()
+    r = realr2.quarantine_keys(["x.jpg"])
+    check("a wrong destination bucket does NOT delete the public copy",
+          not any(o[0] == "delete" for o in ops),
+          "the only copy of the bytes would have been destroyed")
+    check("...and it is reported as failed, not moved", r["failed"] == 1 and r["moved"] == 0, r)
+    check("...and NoSuchBucket is not mistaken for NoSuchKey", r["already_gone"] == 0, r)
+
+    # a copy that threw but actually landed -> the public copy is redundant and may go
+    q.code = "SlowDown"
+    q.head_ok = True
+    ops.clear()
+    r = realr2.quarantine_keys(["x.jpg"])
+    check("a copy that DID land lets the public copy be deleted",
+          any(o[0] == "delete" and o[1] == "pub" for o in ops), ops)
+    check("...and counts as moved", r["moved"] == 1 and r["failed"] == 0, r)
+
+    # ...but only if the delete itself works
+    q.delete_raises = True
+    ops.clear()
+    r = realr2.quarantine_keys(["x.jpg"])
+    check("a delete that fails is NOT counted as moved",
+          r["moved"] == 0 and r["failed"] == 1,
+          "the object is still at its public URL; reporting it moved is the lie this rewrite removes")
+    q.delete_raises = False
+
 except Exception as e:                                  # noqa: BLE001
     check("the real r2 module loads", False, f"{type(e).__name__}: {e}")
 
